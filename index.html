@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>YipYap</title>
+<script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+<h1>YipYap</h1>
+<p>Welcome to YipYap! Chat about anything!</p>
+
+<div id="join" style="display:none">
+  <input id="name-input" placeholder="username (max 20 chars)" maxlength="20" autocomplete="off">
+  <button id="join-btn">Join</button>
+  <span id="join-status"></span>
+</div>
+
+<div id="send" style="display:none">
+  <input id="msg-input" placeholder="message… (enter to send)" maxlength="500" autocomplete="off">
+  <button id="send-btn">Send</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  const ROOM        = 'YipYap';
+  const HISTORY_KEY = 'yipyap.history';
+  const NAME_KEY    = 'yipyap.name';
+  const MAX_MSG     = 500;
+  const MAX_NAME    = 20;
+  const NAME_RE     = /^[a-zA-Z0-9_ .-]{1,20}$/;
+
+  const joinDiv    = document.getElementById('join');
+  const nameInput  = document.getElementById('name-input');
+  const joinBtn    = document.getElementById('join-btn');
+  const joinStatus = document.getElementById('join-status');
+  const sendDiv    = document.getElementById('send');
+  const msgInput   = document.getElementById('msg-input');
+  const sendBtn    = document.getElementById('send-btn');
+  const log        = document.getElementById('log');
+
+  let myName     = '';
+  let takenNames = new Set();
+  let history    = loadHistory();
+  let pending    = [];
+  let role       = null;
+  let hostConn   = null;
+  let guests     = [];
+  let activePeer = null;
+
+  /* ---------- storage ---------- */
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      if (!raw) return [];
+      const arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(validMsg);
+    } catch (_) { return []; }
+  }
+  function saveHistory() {
+    try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history)); } catch (_) {}
+  }
+  function saveName(name) {
+    try { localStorage.setItem(NAME_KEY, name); } catch (_) {}
+  }
+  function loadName() {
+    try { return localStorage.getItem(NAME_KEY) || ''; } catch (_) { return ''; }
+  }
+  function clearName() {
+    try { localStorage.removeItem(NAME_KEY); } catch (_) {}
+  }
+
+  /* ---------- validation ---------- */
+  function validMsg(m) {
+    return m && typeof m === 'object'
+      && typeof m.time === 'string' && m.time.length > 0 && m.time.length < 40
+      && typeof m.name === 'string' && NAME_RE.test(m.name)
+      && typeof m.text === 'string' && m.text.length > 0 && m.text.length <= MAX_MSG;
+  }
+  function validMsgBody(m) {
+    return m && typeof m === 'object'
+      && typeof m.time === 'string' && m.time.length > 0 && m.time.length < 40
+      && typeof m.text === 'string' && m.text.length > 0 && m.text.length <= MAX_MSG;
+  }
+  function keyOf(m) { return m.time + '\u0001' + m.name + '\u0001' + m.text; }
+
+  /* ---------- history merge (no cap) ---------- */
+  function mergeHistory(incoming) {
+    if (!Array.isArray(incoming)) return false;
+    const seen = new Set(history.map(keyOf));
+    let changed = false;
+    for (const m of incoming) {
+      if (!validMsg(m)) continue;
+      const k = keyOf(m);
+      if (seen.has(k)) continue;
+      history.push({ time: m.time, name: m.name, text: m.text });
+      seen.add(k);
+      changed = true;
+    }
+    if (!changed) return false;
+    history.sort((a, b) => a.time.localeCompare(b.time));
+    saveHistory();
+    renderAll();
+    return true;
+  }
+
+  /* ---------- rendering ---------- */
+  function stamp(d) {
+    d = d || new Date();
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getDate()) + '/' + p(d.getMonth() + 1) + '/' + d.getFullYear()
+      + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+      + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  }
+  function makeLine(m) {
+    const div = document.createElement('div');
+    const b = document.createElement('b');
+    b.textContent = m.time + '@' + m.name;
+    div.appendChild(b);
+    div.appendChild(document.createTextNode('> ' + m.text));
+    return div;
+  }
+  function renderAll() {
+    while (log.firstChild) log.removeChild(log.firstChild);
+    for (let i = history.length - 1; i >= 0; i--) log.appendChild(makeLine(history[i]));
+  }
+  function addMessage(m) {
+    history.push(m);
+    saveHistory();
+    log.insertBefore(makeLine(m), log.firstChild);
+  }
+
+  /* ---------- sending ---------- */
+  function broadcast(msg) {
+    if (role === 'host') {
+      guests.forEach(g => { if (g.open) { try { g.send(msg); } catch (_) {} } });
+    } else if (hostConn && hostConn.open) {
+      try { hostConn.send(msg); } catch (_) {}
+    }
+  }
+  function sendText(text) {
+    if (!myName) return;
+    const m = { time: stamp(), name: myName, text };
+    addMessage(m);
+    broadcast({ type: 'msg', time: m.time, name: m.name, text: m.text });
+  }
+  function send() {
+    const text = msgInput.value.trim().slice(0, MAX_MSG);
+    if (!text) return;
+    msgInput.value = '';
+    if (!role) { pending.push(text); return; }
+    sendText(text);
+  }
+  function flushPending() {
+    while (pending.length) sendText(pending.shift());
+  }
+
+  /* ---------- stage UI ---------- */
+  function showJoin(message) {
+    joinDiv.style.display = '';
+    sendDiv.style.display = 'none';
+    joinStatus.textContent = message || '';
+    msgInput.disabled = true;
+    nameInput.focus();
+  }
+  function showSend() {
+    joinDiv.style.display = 'none';
+    sendDiv.style.display = '';
+    joinStatus.textContent = '';
+    msgInput.disabled = false;
+    msgInput.focus();
+  }
+  function showSendDisabled() {
+    joinDiv.style.display = 'none';
+    sendDiv.style.display = '';
+    joinStatus.textContent = '';
+    msgInput.disabled = true;
+  }
+
+  /* ---------- teardown ---------- */
+  function teardown() {
+    const old = activePeer;
+    activePeer = null;
+    role = null;
+    hostConn = null;
+    guests = [];
+    if (old) { try { old.destroy(); } catch (_) {} }
+  }
+
+  /* ---------- host ---------- */
+  function beHost() {
+    if (!myName) { showJoin('Enter a username to join.'); return; }
+    teardown();
+
+    const p = new Peer(ROOM, { debug: 0 });
+    activePeer = p;
+    let opened = false;
+
+    p.on('open', () => {
+      if (activePeer !== p) return;
+      opened = true;
+      role = 'host';
+      takenNames = new Set([myName.toLowerCase()]);
+      showSend();
+      flushPending();
+    });
+
+    p.on('connection', c => {
+      if (activePeer !== p) return;
+      let accepted = false;
+      let guestLower = null;
+
+      c.on('data', m => {
+        if (activePeer !== p) return;
+        if (!m || typeof m !== 'object' || typeof m.type !== 'string') return;
+
+        if (!accepted) {
+          if (m.type === 'hello') {
+            const nm  = typeof m.name === 'string' ? m.name : '';
+            const nml = nm.toLowerCase();
+            if (!NAME_RE.test(nm)) {
+              try { c.send({ type: 'reject', reason: 'invalid-name' }); } catch (_) {}
+              setTimeout(() => { try { c.close(); } catch (_) {} }, 100);
+              return;
+            }
+            if (takenNames.has(nml)) {
+              try { c.send({ type: 'reject', reason: 'name-taken' }); } catch (_) {}
+              setTimeout(() => { try { c.close(); } catch (_) {} }, 100);
+              return;
+            }
+            takenNames.add(nml);
+            guestLower  = nml;
+            c.username  = nm;
+            accepted    = true;
+            guests.push(c);
+            try { c.send({ type: 'welcome' }); } catch (_) {}
+            try { c.send({ type: 'history', history }); } catch (_) {}
+          }
+          return;
+        }
+
+        if (m.type === 'msg' && validMsgBody(m)) {
+          const entry = { time: m.time, name: c.username, text: m.text };
+          addMessage(entry);
+          guests.forEach(g => {
+            if (g !== c && g.open) {
+              try { g.send({ type: 'msg', time: entry.time, name: entry.name, text: entry.text }); } catch (_) {}
+            }
+          });
+        } else if (m.type === 'history') {
+          if (mergeHistory(m.history)) {
+            guests.forEach(g => {
+              if (g.open) { try { g.send({ type: 'history', history }); } catch (_) {} }
+            });
+          }
+        }
+      });
+
+      const drop = () => {
+        if (guestLower) takenNames.delete(guestLower);
+        guests = guests.filter(g => g !== c);
+      };
+      c.on('close', drop);
+      c.on('error', drop);
+    });
+
+    p.on('error', e => {
+      if (activePeer !== p) return;
+      const wasOpen = opened;
+      const isUnavailable = e && e.type === 'unavailable-id';
+      teardown();
+      if (!wasOpen && isUnavailable) setTimeout(beGuest, 50);
+      else setTimeout(beHost, 2000);
+    });
+
+    p.on('disconnected', () => {
+      if (activePeer !== p) return;
+      try { p.reconnect(); } catch (_) {}
+    });
+  }
+
+  /* ---------- guest ---------- */
+  function beGuest() {
+    if (!myName) { showJoin('Enter a username to join.'); return; }
+    teardown();
+
+    const p = new Peer({ debug: 0 });
+    activePeer = p;
+
+    p.on('open', () => {
+      if (activePeer !== p) return;
+      const c = p.connect(ROOM, { reliable: true });
+      hostConn = c;
+
+      c.on('open', () => {
+        if (activePeer !== p) return;
+        try { c.send({ type: 'hello', name: myName }); } catch (_) {}
+      });
+
+      c.on('data', m => {
+        if (activePeer !== p) return;
+        if (!m || typeof m !== 'object' || typeof m.type !== 'string') return;
+
+        if (m.type === 'reject') {
+          const reason = m.reason === 'invalid-name'
+            ? 'Invalid username format.'
+            : 'That username is already taken.';
+          teardown();
+          myName = '';
+          clearName();
+          showJoin(reason + ' Choose another:');
+          return;
+        }
+
+        if (m.type === 'welcome') {
+          role = 'guest';
+          showSend();
+          try { c.send({ type: 'history', history }); } catch (_) {}
+          flushPending();
+          return;
+        }
+
+        if (m.type === 'msg' && validMsg(m)) {
+          addMessage({ time: m.time, name: m.name, text: m.text });
+        } else if (m.type === 'history') {
+          mergeHistory(m.history);
+        }
+      });
+
+      const fail = () => {
+        if (activePeer !== p) return;
+        teardown();
+        showSendDisabled();
+        setTimeout(beHost, 2000);
+      };
+      c.on('close', fail);
+      c.on('error', fail);
+    });
+
+    p.on('error', () => {
+      if (activePeer !== p) return;
+      teardown();
+      showSendDisabled();
+      setTimeout(beHost, 2000);
+    });
+
+    p.on('disconnected', () => {
+      if (activePeer !== p) return;
+      try { p.reconnect(); } catch (_) {}
+    });
+  }
+
+  /* ---------- boot / auto-join ---------- */
+  function beginWithName(name) {
+    myName = name;
+    showSend();
+    beHost();
+  }
+
+  function startFromJoinForm() {
+    const v = nameInput.value.trim().slice(0, MAX_NAME);
+    if (!NAME_RE.test(v)) {
+      joinStatus.textContent = 'Invalid username. Use letters, numbers, space, _ . - (max 20 chars).';
+      return;
+    }
+    saveName(v);
+    beginWithName(v);
+  }
+
+  joinBtn.addEventListener('click', startFromJoinForm);
+  nameInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); startFromJoinForm(); }
+  });
+  sendBtn.addEventListener('click', () => { send(); });
+  msgInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); send(); }
+  });
+
+  renderAll();
+
+  const saved = loadName();
+  if (saved && NAME_RE.test(saved)) {
+    beginWithName(saved);
+  } else {
+    if (saved) clearName();
+    showJoin('');
+  }
+})();
+</script>
+</body>
+</html>
